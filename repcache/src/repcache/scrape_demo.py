@@ -364,10 +364,282 @@ def main():
         check("no new traffic after reopen", len(server.requests("/stable")) == 1)
         client.close()
 
+        client = RepCacheClient(db, clock=clock, timeout=5.0)
+        run_stale_if_error_scenarios(client, server, clock)
+
         print("\nall scenarios passed")
     finally:
         server.stop()
         tmp.cleanup()
+
+
+def run_stale_if_error_scenarios(client, server, clock):
+    """Opt-in stale-if-error drill: all against the local service."""
+
+    SI_BODY = b"directory v1 (fallback candidate)"
+    SI_NEW = b"directory v2 (recovered)"
+
+    def prime(path, cache_control="max-age=10, stale-if-error=60",
+              vary="Accept-Language", etag='"sie1"'):
+        def route(req):
+            if req.header("if-none-match") == etag:
+                return ResponseSpec(
+                    304, [("Vary", vary), ("Cache-Control", cache_control),
+                          ("Date", http_date(clock()))], b"")
+            return ResponseSpec(
+                200,
+                [("Vary", vary), ("Cache-Control", cache_control),
+                 ("ETag", etag), ("Date", http_date(clock()))],
+                SI_BODY,
+            )
+
+        server.route(path, route)
+        url = server.url(path)
+        check(f"primed {path}",
+              client.get(url, {"Accept-Language": "zh"}).body == SI_BODY)
+        return url
+
+    def outage(path, status=503):
+        server.route(path, lambda req: ResponseSpec(status, [], b"origin down"))
+
+    print("scenario 13: stale-if-error is off by default")
+    url = prime("/sie")
+    clock.advance(20)  # 10s past the lifetime
+    outage("/sie")
+    before = len(server.requests("/sie"))
+    res = client.get(url, {"Accept-Language": "zh"})
+    check("without opting in the 503 surfaces unchanged",
+          res.source is Source.NETWORK and res.status == 503 and not res.stale
+          and res.body == b"origin down")
+    check("the default call made one request",
+          len(server.requests("/sie")) == before + 1)
+
+    print("scenario 14: stale-if-error serves the stale body and labels it")
+    res = client.get(url, {"Accept-Language": "zh"}, stale_if_error=60)
+    check("marked as a stale-if-error fallback",
+          res.source is Source.STALE_IF_ERROR and res.stale and res.stale_fallback)
+    check("body is the aged representation", res.body == SI_BODY)
+    check("upstream 503 is preserved", res.network_status == 503
+          and res.stale_fallback.upstream_status == 503)
+    check("actual staleness and both limits reported",
+          res.stale_fallback.staleness == 10.0
+          and res.stale_fallback.server_limit == 60.0
+          and res.stale_fallback.caller_limit == 60.0
+          and res.stale_fallback.allowed_seconds == 60.0)
+    check("not presented as fresh or revalidated",
+          res.source is not Source.CACHE and res.source is not Source.REVALIDATED
+          and not res.validated)
+
+    print("scenario 15: the stricter of server grant and caller limit wins")
+    url = prime("/sie-strict", cache_control="max-age=10, stale-if-error=20")
+    clock.advance(25)  # 15s stale
+    outage("/sie-strict", 500)
+    res = client.get(url, {"Accept-Language": "zh"}, stale_if_error=100)
+    check("server limit is the stricter bound",
+          res.stale and res.stale_fallback.allowed_seconds == 20.0
+          and res.stale_fallback.caller_limit == 100.0)
+    res = client.get(url, {"Accept-Language": "zh"}, stale_if_error=20)
+    check("caller limit can never exceed the server grant",
+          res.stale and res.stale_fallback.allowed_seconds == 20.0)
+    res = client.get(url, {"Accept-Language": "zh"}, stale_if_error=15)
+    check("a caller limit equal to the staleness is still allowed",
+          res.stale and res.stale_fallback.staleness == 15.0)
+    res = client.get(url, {"Accept-Language": "zh"}, stale_if_error=14)
+    check("one second under the staleness is refused",
+          res.source is Source.NETWORK and res.status == 500 and not res.stale)
+
+    print("scenario 16: ineligible statuses and protocol/size failures")
+    url = prime("/sie-other", cache_control="max-age=10, stale-if-error=600")
+    clock.advance(20)
+    for status in (400, 404, 501, 505):
+        outage("/sie-other", status)
+        res = client.get(url, {"Accept-Language": "zh"}, stale_if_error=600)
+        check(f"{status} is passed through, not masked",
+              res.source is Source.NETWORK and res.status == status and not res.stale)
+    server.route("/sie-other", lambda req: ResponseSpec(
+        200, [("Content-Length", "4096"), ("Date", http_date(clock()))], b"short"))
+    try:
+        client.get(url, {"Accept-Language": "zh"}, stale_if_error=600)
+        raise SystemExit("expected a length mismatch to surface")
+    except NetworkError:
+        check("length mismatch is never masked by a stale body", True)
+    server.route("/sie-other", lambda req: ResponseSpec(
+        200, [("Cache-Control", "max-age=-1"), ("Date", http_date(clock()))], b"bad meta"))
+    try:
+        client.get(url, {"Accept-Language": "zh"}, stale_if_error=600)
+        raise SystemExit("expected invalid metadata to surface")
+    except ProtocolError:
+        check("invalid response metadata is never masked", True)
+
+    print("scenario 17: the staleness boundary (equality ok, one over not)")
+    url = prime("/sie-edge", cache_control="max-age=10, stale-if-error=30")
+    clock.advance(40)  # exactly 30 stale
+    outage("/sie-edge")
+    check("exactly at the allowed staleness: served",
+          client.get(url, {"Accept-Language": "zh"}, stale_if_error=30).stale)
+    clock.advance(1)
+    res = client.get(url, {"Accept-Language": "zh"}, stale_if_error=30)
+    check("one second past the allowed staleness: the 503 surfaces",
+          res.source is Source.NETWORK and res.status == 503 and not res.stale)
+
+    print("scenario 18: no grant / no-cache / must-revalidate / Vary mismatch")
+    url = prime("/sie-nogrant", cache_control="max-age=10")
+    clock.advance(20)
+    outage("/sie-nogrant")
+    res = client.get(url, {"Accept-Language": "zh"}, stale_if_error=600)
+    check("no stale-if-error grant: not served",
+          res.source is Source.NETWORK and res.status == 503 and not res.stale)
+    for i, cc in enumerate([
+        "max-age=10, stale-if-error=600, no-cache",
+        "max-age=10, stale-if-error=600, must-revalidate",
+    ]):
+        path = f"/sie-veto{i}"
+        url = prime(path, cache_control=cc)
+        clock.advance(12)
+        outage(path)
+        res = client.get(url, {"Accept-Language": "zh"}, stale_if_error=600)
+        check(f"{cc.split(', ')[-1]} vetoes the stale body",
+              res.source is Source.NETWORK and res.status == 503 and not res.stale)
+
+    state = {"down": False}
+
+    def route_lang(req):
+        if state["down"]:
+            return ResponseSpec(503, [("Date", http_date(clock()))], b"down")
+        lang = req.header("accept-language") or "en"
+        return ResponseSpec(
+            200,
+            [("Vary", "Accept-Language"),
+             ("Cache-Control", "max-age=10, stale-if-error=60"),
+             ("ETag", f'"{lang}-sie"'), ("Date", http_date(clock()))],
+            ZH_BODY if lang == "zh" else EN_BODY,
+        )
+
+    server.route("/sie-lang", route_lang)
+    lang_url = server.url("/sie-lang")
+    client.get(lang_url, {"Accept-Language": "zh"})
+    clock.advance(12)
+    state["down"] = True
+    res = client.get(lang_url, {"Accept-Language": "en"}, stale_if_error=60)
+    check("an en caller never receives the zh stale body",
+          res.source is Source.NETWORK and res.status == 503 and res.body != ZH_BODY)
+
+    print("scenario 19: one shared failure, two waiters, different limits")
+    url = prime("/sie-shared", cache_control="max-age=10, stale-if-error=60")
+    clock.advance(25)  # 15s stale
+    gate, arrived = Gate(), Flag()
+
+    def route_shared(req):
+        arrived.set()
+        gate.wait()
+        return ResponseSpec(503, [("Date", http_date(clock()))], b"down")
+
+    server.route("/sie-shared", route_shared)
+    results, errors = [None, None], [None, None]
+
+    def call(i, lim):
+        try:
+            results[i] = client.get(url, {"Accept-Language": "zh"}, stale_if_error=lim)
+        except BaseException as exc:  # noqa: BLE001
+            errors[i] = exc
+
+    before = len(server.requests("/sie-shared"))
+    ts = [threading.Thread(target=call, args=(0, 20)),
+          threading.Thread(target=call, args=(1, 10))]
+    for t in ts:
+        t.start()
+    arrived.wait()
+    gate.open()
+    for t in ts:
+        t.join(15)
+    check("exactly one shared request",
+          len(server.requests("/sie-shared")) == before + 1)
+    check("no caller raised",
+          errors == [None, None])
+    check("the 20s waiter received the stale body",
+          results[0].stale and results[0].source is Source.STALE_IF_ERROR)
+    check("the 10s waiter got the upstream 503 instead",
+          results[1].source is Source.NETWORK and results[1].status == 503
+          and not results[1].stale)
+
+    print("scenario 20: refresh replacement is not undone by a late failure")
+    V1, V2 = b"directory v1", b"directory v2 (refreshed)"
+    gate2, arrived2, state2 = Gate(), Flag(), {"phase": 1}
+
+    def route_refresh(req):
+        if req.header("if-none-match") == '"r1"':
+            arrived2.set()
+            gate2.wait()
+            return ResponseSpec(503, [("Date", http_date(clock()))], b"down")
+        if state2["phase"] == 1:
+            return ResponseSpec(
+                200, [("Vary", "Accept-Language"),
+                      ("Cache-Control", "max-age=10, stale-if-error=60"),
+                      ("ETag", '"r1"'), ("Date", http_date(clock()))], V1)
+        return ResponseSpec(
+            200, [("Vary", "Accept-Language"),
+                  ("Cache-Control", "max-age=300, stale-if-error=60"),
+                  ("ETag", '"r2"'), ("Date", http_date(clock()))], V2)
+
+    server.route("/sie-refresh", route_refresh)
+    rurl = server.url("/sie-refresh")
+    client.get(rurl, {"Accept-Language": "zh"})
+    state2["phase"] = 2
+    clock.advance(20)
+    held = {}
+
+    def stale_call():
+        try:
+            held["res"] = client.get(rurl, {"Accept-Language": "zh"}, stale_if_error=60)
+        except BaseException as exc:  # noqa: BLE001
+            held["err"] = exc
+
+    t = threading.Thread(target=stale_call)
+    t.start()
+    arrived2.wait()
+    check("refresh published v2", client.refresh(rurl, {"Accept-Language": "zh"}).body == V2)
+    gate2.open()
+    t.join(15)
+    check("late failure did not resurrect v1",
+          "err" not in held and held["res"].body == V2)
+    check("the replacement is a fresh hit, not a fallback",
+          held["res"].source is Source.CACHE and not held["res"].stale)
+
+    print("scenario 21: next upstream success refetches and updates the cache")
+    state3 = {"up": False}
+
+    def route_rec(req):
+        if state3["up"]:
+            return ResponseSpec(
+                200, [("Vary", "Accept-Language"),
+                      ("Cache-Control", "max-age=300, stale-if-error=60"),
+                      ("ETag", '"rec2"'), ("Date", http_date(clock()))], SI_NEW)
+        return ResponseSpec(
+            200, [("Vary", "Accept-Language"),
+                  ("Cache-Control", "max-age=10, stale-if-error=60"),
+                  ("ETag", '"rec1"'), ("Date", http_date(clock()))], SI_BODY)
+
+    server.route("/sie-rec", route_rec)
+    rec_url = server.url("/sie-rec")
+    client.get(rec_url, {"Accept-Language": "zh"})
+    clock.advance(20)
+    outage("/sie-rec")
+    res = client.get(rec_url, {"Accept-Language": "zh"}, stale_if_error=60)
+    check("stale fallback served during the outage", res.stale and res.body == SI_BODY)
+    state3["up"] = True
+    server.route("/sie-rec", route_rec)
+    clock.advance(1)
+    before = len(server.requests("/sie-rec"))
+    res = client.get(rec_url, {"Accept-Language": "zh"}, stale_if_error=60)
+    check("recovery refetched a fresh 200",
+          res.source is Source.NETWORK and res.network_status == 200
+          and res.body == SI_NEW and not res.stale)
+    check("exactly one recovery request",
+          len(server.requests("/sie-rec")) == before + 1)
+    res = client.get(rec_url, {"Accept-Language": "zh"})
+    check("cache updated to the new lifetime and body",
+          res.source is Source.CACHE and res.body == SI_NEW and res.age.lifetime == 300.0)
+    client.close()
 
 
 if __name__ == "__main__":

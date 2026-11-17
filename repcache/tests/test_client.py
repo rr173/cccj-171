@@ -21,6 +21,10 @@ from repcache import (  # noqa: E402
     RequestRejected,
     NetworkError,
     Source,
+    LengthMismatchError,
+    MalformedResponseError,
+    OversizeError,
+    TransportError,
 )
 from repcache.demo_server import (  # noqa: E402
     DemoServer,
@@ -613,6 +617,996 @@ class TestNetworkTimeout(ClientTestCase):
         # nothing cached as success: a later call tries the network again
         self.server.route("/slow", lambda req: ResponseSpec(200, [], b"recovered"))
         self.assertEqual(self.client.get(url).body, b"recovered")
+
+
+class ScriptedServer:
+    """A tiny 127.0.0.1 TCP server that runs scripted per-connection handlers.
+
+    Used to produce transport failures (connection reset, truncated chunked
+    stream) that the friendly demo server cannot express through routes.
+    """
+
+    def __init__(self):
+        import socket
+
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(8)
+        self._sock.settimeout(0.05)
+        self.port = self._sock.getsockname()[1]
+        self._handlers = []
+        self._lock = threading.Lock()
+        self._seen = 0
+        self._stop = False
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def url(self, path="/dir"):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def script(self, handler):
+        with self._lock:
+            self._handlers.append(handler)
+
+    @property
+    def accepted(self):
+        return self._seen
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop = True
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=5)
+
+    def _serve(self):
+        import socket
+
+        while not self._stop:
+            try:
+                conn, _ = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with self._lock:
+                handler = self._handlers.pop(0) if self._handlers else None
+                self._seen += 1
+            try:
+                conn.settimeout(5.0)
+                handler(conn, self)
+            except OSError:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+
+def send_200(sock, body, cache_control="max-age=10, stale-if-error=60"):
+    sock.recv(65536)  # request headers
+    head = (
+        "HTTP/1.1 200 OK\r\n"
+        f"Cache-Control: {cache_control}\r\n"
+        "Content-Type: text/plain\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode()
+    sock.sendall(head + body)
+
+
+def reset_connection(sock, server):
+    sock.recv(65536)  # read the request, then vanish without a response
+    sock.setsockopt(1, 13, 0)  # SOL_SOCKET/SO_LINGER: force an RST on close
+
+
+def truncate_chunked(sock, server):
+    sock.recv(65536)
+    head = (
+        "HTTP/1.1 200 OK\r\n"
+        "Cache-Control: max-age=10, stale-if-error=60\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode()
+    sock.sendall(head + b"9\r\n" + b"short")  # promised 9 bytes, sent 5, cut
+
+
+def speak_garbage(sock, server):
+    sock.recv(65536)
+    sock.sendall(b"not http at all\r\n\r\n")
+
+
+class TestStaleIfErrorTransport(ClientTestCase):
+    """Transport-level fallback against a scripted local socket server."""
+
+    BODY = b"scripted stale body"
+
+    def setUp(self):
+        super().setUp()
+        self.scripts = ScriptedServer().start()
+
+    def tearDown(self):
+        self.scripts.stop()
+        super().tearDown()
+
+    def _prime(self):
+        self.scripts.script(lambda sock, srv: send_200(sock, self.BODY))
+        url = self.scripts.url("/dir")
+        res = self.client.get(url)
+        self.assertEqual(res.body, self.BODY)
+        self.assertEqual(self.scripts.accepted, 1)
+        self.clock.advance(12)  # stale by 2s
+        return url
+
+    def test_connection_reset_serves_stale_body(self):
+        url = self._prime()
+        self.scripts.script(reset_connection)
+        res = self.client.get(url, stale_if_error=30)
+        self.assertEqual(res.source, Source.STALE_IF_ERROR)
+        self.assertEqual(res.body, self.BODY)
+        self.assertTrue(res.stale)
+        self.assertIsNone(res.network_status)
+        fb = res.stale_fallback
+        self.assertIsNone(fb.upstream_status)
+        self.assertIsNotNone(fb.upstream_error)
+        self.assertAlmostEqual(fb.staleness, 2.0)
+        self.assertEqual(self.scripts.accepted, 2)
+
+    def test_truncated_stream_serves_stale_body(self):
+        url = self._prime()
+        self.scripts.script(truncate_chunked)
+        res = self.client.get(url, stale_if_error=30)
+        self.assertEqual(res.source, Source.STALE_IF_ERROR)
+        self.assertEqual(res.body, self.BODY)
+        self.assertIsNone(res.stale_fallback.upstream_status)
+        self.assertIn(
+            "truncated", res.stale_fallback.upstream_error.lower()
+        )
+
+    def test_connection_reset_without_opt_in_still_raises(self):
+        url = self._prime()
+        self.scripts.script(reset_connection)
+        with self.assertRaises(TransportError):
+            self.client.get(url)
+
+    def test_malformed_framing_is_not_masked(self):
+        url = self._prime()
+        self.scripts.script(speak_garbage)
+        with self.assertRaises(MalformedResponseError):
+            self.client.get(url, stale_if_error=600)
+
+    def test_oversize_via_socket_is_not_masked(self):
+        url = self._prime()
+        self.scripts.script(
+            lambda sock, srv: send_200(sock, b"x" * 100, cache_control="max-age=10, stale-if-error=600")
+        )
+        self.client.close()
+        self.client = self.new_client(max_bytes=32)
+        with self.assertRaises(NetworkError):
+            self.client.get(url, stale_if_error=600)
+
+
+class TestStaleIfError(ClientTestCase):
+    """Per-call stale-if-error fallback, entirely against the local server."""
+
+    BODY = b"directory v1 (stale candidate)"
+    LATER = b"directory v2 (recovered)"
+
+    def prime(self, path="/sie", *, cache_control="max-age=10, stale-if-error=60",
+              vary="Accept-Language", etag='"s1"', body=None):
+        """Store one representation; returns the URL after it is stale."""
+
+        def route(req):
+            if req.header("if-none-match") == etag:
+                return ResponseSpec(
+                    304,
+                    [("Vary", vary), ("Cache-Control", cache_control),
+                     ("Date", http_date(self.clock()))],
+                    b"",
+                )
+            return ResponseSpec(
+                200,
+                [("Vary", vary), ("Cache-Control", cache_control),
+                 ("ETag", etag), ("Date", http_date(self.clock()))],
+                body if body is not None else self.BODY,
+            )
+
+        self.server.route(path, route)
+        url = self.url(path)
+        res = self.client.get(url, {"Accept-Language": "zh"})
+        self.assertEqual(res.body, body if body is not None else self.BODY)
+        self.assertEqual(len(self.server.requests(path)), 1)
+        return url
+
+    def assert_fallback(self, res, *, status=None, staleness=None):
+        self.assertEqual(res.source, Source.STALE_IF_ERROR)
+        self.assertTrue(res.stale)
+        self.assertFalse(res.from_cache)
+        self.assertTrue(res.from_stale)
+        self.assertEqual(res.status, 200)  # the representation itself is a 200
+        self.assertFalse(res.ok)  # ...but this is not a successful fetch
+        self.assertEqual(res.body, self.BODY)
+        fb = res.stale_fallback
+        self.assertIsNotNone(fb)
+        self.assertEqual(fb.upstream_status, status)
+        if status is None:  # transport failure
+            self.assertIsNotNone(fb.upstream_error)
+        else:  # HTTP failure
+            self.assertIsNone(fb.upstream_error)
+        self.assertEqual(res.network_status, status)
+        if staleness is not None:
+            self.assertAlmostEqual(fb.staleness, staleness, places=3)
+        return fb
+
+    def assert_no_fallback_503(self, res, status=503):
+        """Without a granted fallback an eligible HTTP failure stays a plain
+        upstream failure result (source NETWORK, not stale, not cached)."""
+
+        self.assertEqual(res.status, status)
+        self.assertEqual(res.source, Source.NETWORK)
+        self.assertEqual(res.network_status, status)
+        self.assertFalse(res.stale)
+        self.assertIsNone(res.stale_fallback)
+
+    def assert_no_fallback(self, url, status=503):
+        """Either the upstream status passes through, or a transport failure
+        is raised; in no case is a stale body handed out."""
+
+        try:
+            res = self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=60)
+        except NetworkError:
+            return
+        self.assert_no_fallback_503(res, status)
+
+    # -- eligibility and combined limits --------------------------------
+
+    def test_disabled_by_default_still_fails(self):
+        url = self.prime()
+        self.clock.advance(20)  # stale by 10s
+        self.server.route("/sie", lambda req: ResponseSpec(503, [], b"down"))
+        before = len(self.server.requests("/sie"))
+        res = self.client.get(url, {"Accept-Language": "zh"})
+        self.assert_no_fallback_503(res)
+        self.assertEqual(len(self.server.requests("/sie")), before + 1)
+
+    def test_transport_timeout_serves_stale_body(self):
+        url = self.prime()
+        self.clock.advance(20)
+        gate = Gate()
+        self.server.route("/sie", lambda req: (gate.wait(), ResponseSpec(200, [], b"late"))[1])
+        self.client.close()
+        self.client = self.new_client(timeout=0.3)
+        # lead the call with a bounded per-call limit; the deadline fires.
+        res = self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=30)
+        gate.open()
+        fb = self.assert_fallback(res, status=None, staleness=10.0)
+        self.assertEqual(fb.allowed_seconds, 30.0)  # caller limit is stricter
+        self.assertEqual(fb.server_limit, 60.0)
+        self.assertEqual(fb.caller_limit, 30.0)
+        self.assertIn("timeout", fb.upstream_error.lower())
+
+    def test_503_serves_body_with_upstream_status(self):
+        url = self.prime()
+        self.clock.advance(20)
+        self.server.route(
+            "/sie", lambda req: ResponseSpec(503, [("Date", http_date(self.clock()))], b"unavailable")
+        )
+        res = self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=60)
+        self.assert_fallback(res, status=503, staleness=10.0)
+        self.assertEqual(len(self.server.requests("/sie")), 2)
+
+    def test_strictest_of_server_and_caller_wins(self):
+        # server grant 60, caller 20 -> allowed 20; stale by 10 is fine
+        url = self.prime()
+        self.clock.advance(20)
+        self.server.route("/sie", lambda req: ResponseSpec(500, [], b"boom"))
+        fb = self.assert_fallback(
+            self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=20),
+            status=500, staleness=10.0,
+        )
+        self.assertEqual(fb.allowed_seconds, 20.0)
+
+        # server grant 20, caller 100 -> allowed 20
+        url2 = self.prime("/sie2", cache_control="max-age=10, stale-if-error=20")
+        self.clock.advance(20)
+        self.server.route("/sie2", lambda req: ResponseSpec(502, [], b"bad gateway"))
+        fb2 = self.assert_fallback(
+            self.client.get(url2, {"Accept-Language": "zh"}, stale_if_error=100),
+            status=502, staleness=10.0,
+        )
+        self.assertEqual(fb2.allowed_seconds, 20.0)
+        self.assertEqual(fb2.server_limit, 20.0)
+
+    # -- the staleness boundary: equality allowed, one second over not ---
+
+    def test_staleness_boundary_equality_allowed_over_limit_rejected(self):
+        url = self.prime(cache_control="max-age=10, stale-if-error=30")
+        self.clock.advance(40)  # staleness exactly 30
+        self.server.route("/sie", lambda req: ResponseSpec(503, [], b"down"))
+        fb = self.assert_fallback(
+            self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=30),
+            status=503, staleness=30.0,
+        )
+        self.assertEqual(fb.allowed_seconds, 30.0)
+        # one second past the grant: the upstream failure must surface
+        self.clock.advance(1)
+        res = self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=30)
+        self.assert_no_fallback_503(res)
+
+    def test_caller_limit_boundary_equality_allowed_over_rejected(self):
+        url = self.prime(cache_control="max-age=10, stale-if-error=60")
+        self.clock.advance(40)  # staleness 30
+        self.server.route("/sie", lambda req: ResponseSpec(503, [], b"down"))
+        # caller limit exactly equals the staleness: allowed
+        fb = self.assert_fallback(
+            self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=30),
+            status=503, staleness=30.0,
+        )
+        self.assertEqual(fb.allowed_seconds, 30.0)  # caller bound was stricter
+        # one second older than the caller's limit, though within the server's
+        self.clock.advance(1)
+        res = self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=30)
+        self.assert_no_fallback_503(res)
+        # the server grant alone would have admitted it
+        self.assertTrue(
+            self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=31).stale
+        )
+
+    def test_no_grant_no_fallback(self):
+        url = self.prime(cache_control="max-age=10")  # no stale-if-error
+        self.clock.advance(12)
+        self.server.route("/sie", lambda req: ResponseSpec(503, [], b"down"))
+        res = self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=1000)
+        self.assert_no_fallback_503(res)
+
+    def test_no_cache_and_must_revalidate_veto_the_grant(self):
+        for i, cc in enumerate([
+            "max-age=10, stale-if-error=60, no-cache",
+            "max-age=10, stale-if-error=60, must-revalidate",
+        ]):
+            with self.subTest(cache_control=cc):
+                path = f"/veto{i}"
+                url = self.prime(path, cache_control=cc)
+                self.clock.advance(12)
+                self.server.route(path, lambda req: ResponseSpec(503, [], b"down"))
+                self.assert_no_fallback(url)
+
+    def test_no_store_response_is_never_stored_for_fallback(self):
+        def route(req):
+            return ResponseSpec(
+                200,
+                [("Cache-Control", "no-store, max-age=10, stale-if-error=60"),
+                 ("Date", http_date(self.clock()))],
+                b"no-store body",
+            )
+
+        self.server.route("/nsie", route)
+        url = self.url("/nsie")
+        self.assertEqual(self.client.get(url).body, b"no-store body")
+        self.server.route("/nsie", lambda req: ResponseSpec(503, [], b"down"))
+        self.clock.advance(12)
+        res = self.client.get(url, stale_if_error=60)
+        self.assert_no_fallback_503(res)
+
+    def test_non_eligible_statuses_still_fail(self):
+        url = self.prime()
+        self.clock.advance(20)
+        for status in (400, 404, 501, 505):
+            with self.subTest(status=status):
+                self.server.route(
+                    "/sie", lambda req, s=status: ResponseSpec(s, [], b"not eligible")
+                )
+                res = self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=60)
+                self.assertEqual(res.source, Source.NETWORK)
+                self.assertEqual(res.status, status)
+                self.assertEqual(res.body, b"not eligible")
+                self.assertFalse(res.stale)
+
+    def test_each_eligible_status_can_fall_back(self):
+        url = self.prime()
+        self.clock.advance(20)
+        for status in (500, 502, 503, 504):
+            with self.subTest(status=status):
+                self.server.route(
+                    "/sie",
+                    lambda req, s=status: ResponseSpec(
+                        s, [("Date", http_date(self.clock()))], b"origin down"
+                    ),
+                )
+                fb = self.assert_fallback(
+                    self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=60),
+                    status=status, staleness=10.0,
+                )
+                self.assertEqual(fb.upstream_status, status)
+
+    def test_failed_conditional_revalidation_falls_back(self):
+        """A 503 answering our If-None-Match also permits the stale body."""
+
+        state = {"down": False}
+
+        def route(req):
+            if state["down"]:
+                return ResponseSpec(503, [], b"down")
+            if req.header("if-none-match") == '"s1"':
+                return ResponseSpec(
+                    304,
+                    [("Cache-Control", "max-age=60"), ("Date", http_date(self.clock()))],
+                    b"",
+                )
+            return ResponseSpec(
+                200,
+                [("Vary", "Accept-Language"),
+                 ("Cache-Control", "max-age=10, stale-if-error=60"),
+                 ("ETag", '"s1"'), ("Date", http_date(self.clock()))],
+                self.BODY,
+            )
+
+        self.server.route("/cond", route)
+        url = self.url("/cond")
+        self.assertEqual(self.client.get(url, {"Accept-Language": "zh"}).body, self.BODY)
+        self.clock.advance(12)
+        state["down"] = True
+        res = self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=60)
+        self.assert_fallback(res, status=503, staleness=2.0)
+        # the failed exchange sent a conditional request...
+        self.assertEqual(self.server.requests("/cond")[1].header("if-none-match"), '"s1"')
+        # ...and the stored representation was not rewritten by the failure
+        state["down"] = False
+        self.clock.advance(1)
+        again = self.client.get(url, {"Accept-Language": "zh"})
+        self.assertEqual(again.source, Source.REVALIDATED)
+        self.assertFalse(again.stale)
+
+    def test_refresh_never_falls_back(self):
+        url = self.prime()
+        self.clock.advance(20)
+        self.server.route("/sie", lambda req: ResponseSpec(503, [], b"down"))
+        res = self.client.refresh(url, {"Accept-Language": "zh"})
+        self.assertEqual(res.status, 503)
+        self.assertEqual(res.source, Source.NETWORK)
+        self.assertFalse(res.stale)
+        self.assertIsNone(res.stale_fallback)
+
+    # -- protocol / size failures are not masked --------------------------
+
+    def test_oversize_and_length_mismatch_and_malformed_are_not_masked(self):
+        url = self.prime()
+        self.clock.advance(20)
+        cases = [
+            (lambda req: ResponseSpec(
+                200, [("Content-Length", "5000"), ("Date", http_date(self.clock()))],
+                b"short"), (LengthMismatchError,)),
+            (lambda req: ResponseSpec(
+                200, [("Content-Length", "5"), ("Content-Length", "6"),
+                      ("Date", http_date(self.clock()))], b"12345"),
+                (ProtocolError,)),
+            (lambda req: ResponseSpec(
+                200, [("Cache-Control", "max-age=-1"),
+                      ("Date", http_date(self.clock()))], b"bad meta"),
+             (ProtocolError,)),
+        ]
+        for fn, excs in cases:
+            with self.subTest(excs=excs):
+                self.server.route("/sie", fn)
+                with self.assertRaises(excs):
+                    self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=600)
+
+        # small max_bytes: an over-size 200 is not masked either
+        small = self.new_client(max_bytes=8)
+        self.client.close()
+        self.client = small
+        self.server.route("/sie", lambda req: ResponseSpec(
+            200, [("Cache-Control", "max-age=10, stale-if-error=600"),
+                  ("Date", http_date(self.clock()))], b"x" * 100))
+        with self.assertRaises(OversizeError):
+            self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=600)
+
+    def test_invalid_caller_limit_is_rejected(self):
+        url = self.prime()
+        for bad in (-1, float("inf"), float("nan"), True, "10"):
+            with self.subTest(value=bad):
+                with self.assertRaises(RequestRejected):
+                    self.client.get(url, stale_if_error=bad)
+        # no traffic was made for those rejected calls
+        self.assertEqual(len(self.server.requests("/sie")), 1)
+
+    # -- Vary must still select the caller ---------------------------------
+
+    def test_vary_mismatch_does_not_cross_languages(self):
+        state = {"down": False}
+
+        def route(req):
+            if state["down"]:
+                return ResponseSpec(503, [("Date", http_date(self.clock()))], b"down")
+            lang = req.header("accept-language") or "en"
+            body = ZH_BODY if lang == "zh" else EN_BODY
+            return ResponseSpec(
+                200,
+                [("Vary", "Accept-Language"),
+                 ("Cache-Control", "max-age=10, stale-if-error=60"),
+                 ("ETag", '"s1"'), ("Date", http_date(self.clock()))],
+                body,
+            )
+
+        self.server.route("/lang", route)
+        url = self.url("/lang")
+        self.assertEqual(self.client.get(url, {"Accept-Language": "zh"}).body, ZH_BODY)
+        self.clock.advance(12)
+        state["down"] = True
+        # the zh representation exists but the en caller must not receive it
+        res = self.client.get(url, {"Accept-Language": "en"}, stale_if_error=60)
+        self.assertEqual(res.source, Source.NETWORK)
+        self.assertEqual(res.status, 503)
+        self.assertNotEqual(res.body, ZH_BODY)
+
+    # -- shared failure, different per-call limits -------------------------
+
+    def test_shared_failure_two_waiters_get_different_outcomes(self):
+        url = self.prime(cache_control="max-age=10, stale-if-error=60")
+        self.clock.advance(25)  # staleness 15
+        gate, arrived = Gate(), Flag()
+
+        def route(req):
+            arrived.set()
+            gate.wait()
+            return ResponseSpec(503, [("Date", http_date(self.clock()))], b"down")
+
+        self.server.route("/sie", route)
+
+        results, errors = [None, None], [None, None]
+
+        def call(i, lim):
+            try:
+                results[i] = self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=lim)
+            except BaseException as exc:  # noqa: BLE001
+                errors[i] = exc
+
+        ts = [threading.Thread(target=call, args=(0, 20)),  # 20 >= 15: fallback
+              threading.Thread(target=call, args=(1, 10))]  # 10 < 15: fail
+        for t in ts:
+            t.start()
+        arrived.wait()
+        gate.open()
+        for t in ts:
+            t.join(15)
+        self.assertEqual(len(self.server.requests("/sie")), 2)  # one shared GET
+        self.assertIsNone(errors[0])
+        self.assertIsNone(errors[1])
+        self.assert_fallback(results[0], status=503, staleness=15.0)
+        self.assert_no_fallback_503(results[1], status=503)
+
+    def test_waiter_can_fall_back_when_leader_opted_out(self):
+        url = self.prime(cache_control="max-age=10, stale-if-error=60")
+        self.clock.advance(25)  # staleness 15
+        gate, arrived = Gate(), Flag()
+
+        def route(req):
+            arrived.set()
+            gate.wait()
+            return ResponseSpec(503, [("Date", http_date(self.clock()))], b"down")
+
+        self.server.route("/sie", route)
+        results, errors = [None, None], [None, None]
+
+        def call(i, lim):
+            try:
+                kwargs = {} if lim is None else {"stale_if_error": lim}
+                results[i] = self.client.get(url, {"Accept-Language": "zh"}, **kwargs)
+            except BaseException as exc:  # noqa: BLE001
+                errors[i] = exc
+
+        ts = [threading.Thread(target=call, args=(0, None)),  # default: off
+              threading.Thread(target=call, args=(1, 60))]  # opted in
+        for t in ts:
+            t.start()
+        arrived.wait()
+        gate.open()
+        for t in ts:
+            t.join(15)
+        self.assertEqual(len(self.server.requests("/sie")), 2)  # one shared GET
+        self.assertEqual(errors, [None, None])
+        self.assert_no_fallback_503(results[0], status=503)
+        self.assert_fallback(results[1], status=503, staleness=15.0)
+
+    def test_leader_falls_back_while_a_waiter_with_a_tighter_limit_does_not(self):
+        url = self.prime(cache_control="max-age=10, stale-if-error=60")
+        self.clock.advance(25)  # staleness 15
+        gate, arrived = Gate(), Flag()
+
+        def route(req):
+            arrived.set()
+            gate.wait()
+            return ResponseSpec(503, [("Date", http_date(self.clock()))], b"down")
+
+        self.server.route("/sie", route)
+        results, errors = [None, None], [None, None]
+
+        def call(i, lim):
+            try:
+                results[i] = self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=lim)
+            except BaseException as exc:  # noqa: BLE001
+                errors[i] = exc
+
+        leader = threading.Thread(target=call, args=(0, 60))
+        leader.start()
+        arrived.wait()  # the leader is deliberately the one on the wire
+        waiter = threading.Thread(
+            target=call,
+            args=(1, 14),  # 14 < 15: too stale for this waiter
+        )
+        waiter.start()
+        time.sleep(0.1)  # let it join the in-flight fetch
+        self.assertEqual(len(self.server.requests("/sie")), 2)
+        gate.open()
+        leader.join(15)
+        waiter.join(15)
+        self.assert_fallback(results[0], status=503, staleness=15.0)
+        self.assert_no_fallback_503(results[1], status=503)
+        self.assertEqual(errors, [None, None])
+
+    # -- refresh replaces the body while the failure is in flight ----------
+
+    def test_refresh_replacement_is_not_resurrected_by_late_failure(self):
+        V1, V2 = b"directory v1", b"directory v2 (refreshed)"
+        gate, arrived, state = Gate(), Flag(), {"phase": 1}
+
+        def route(req):
+            if req.header("if-none-match") == '"v1"':
+                arrived.set()
+                gate.wait()
+                return ResponseSpec(503, [("Date", http_date(self.clock()))], b"down")
+            if state["phase"] == 1:
+                return ResponseSpec(
+                    200,
+                    [("Vary", "Accept-Language"),
+                     ("Cache-Control", "max-age=10, stale-if-error=60"),
+                     ("ETag", '"v1"'), ("Date", http_date(self.clock()))],
+                    V1,
+                )
+            return ResponseSpec(
+                200,
+                [("Vary", "Accept-Language"),
+                 ("Cache-Control", "max-age=300, stale-if-error=60"),
+                 ("ETag", '"v2"'), ("Date", http_date(self.clock()))],
+                V2,
+            )
+
+        self.server.route("/page", route)
+        url = self.url("/page")
+        self.assertEqual(self.client.get(url, {"Accept-Language": "zh"}).body, V1)
+        state["phase"] = 2
+        self.clock.advance(20)  # v1 stale by 10
+
+        held = {}
+        waiting = threading.Event()
+
+        def stale_call():
+            waiting.set()
+            try:
+                held["res"] = self.client.get(
+                    url, {"Accept-Language": "zh"}, stale_if_error=60
+                )
+            except BaseException as exc:  # noqa: BLE001
+                held["err"] = exc
+
+        t = threading.Thread(target=stale_call)
+        t.start()
+        arrived.wait()
+        ref = self.client.refresh(url, {"Accept-Language": "zh"})
+        self.assertEqual(ref.body, V2)
+        gate.open()
+        t.join(15)
+        self.assertFalse(t.is_alive())
+        # refresh published v2 (fresh under max-age=300) before the failure
+        # was resolved: the caller must get v2 as a fresh hit, never v1.
+        self.assertNotIn("err", held)
+        self.assertNotEqual(held["res"].body, V1)
+        self.assertEqual(held["res"].body, V2)
+        self.assertFalse(held["res"].stale)
+        self.assertEqual(held["res"].source, Source.CACHE)
+
+    def test_late_failure_reselects_refreshed_body_without_fallback(self):
+        """Even a caller that did not opt in must never be told the failure
+        when refresh already published a fresh replacement: it re-selects."""
+
+        V1, V2 = b"directory v1", b"directory v2 (refreshed)"
+        gate, arrived, state = Gate(), Flag(), {"phase": 1}
+
+        def route(req):
+            if req.header("if-none-match") == '"v1"':
+                arrived.set()
+                gate.wait()
+                return ResponseSpec(503, [("Date", http_date(self.clock()))], b"down")
+            if state["phase"] == 1:
+                return ResponseSpec(
+                    200,
+                    [("Vary", "Accept-Language"),
+                     ("Cache-Control", "max-age=10, stale-if-error=60"),
+                     ("ETag", '"v1"'), ("Date", http_date(self.clock()))],
+                    V1,
+                )
+            return ResponseSpec(
+                200,
+                [("Vary", "Accept-Language"),
+                 ("Cache-Control", "max-age=300, stale-if-error=60"),
+                 ("ETag", '"v2"'), ("Date", http_date(self.clock()))],
+                V2,
+            )
+
+        self.server.route("/page", route)
+        url = self.url("/page")
+        self.assertEqual(self.client.get(url, {"Accept-Language": "zh"}).body, V1)
+        state["phase"] = 2
+        self.clock.advance(20)
+
+        held = {}
+
+        def stale_call():
+            try:
+                held["res"] = self.client.get(url, {"Accept-Language": "zh"})
+            except BaseException as exc:  # noqa: BLE001
+                held["err"] = exc
+
+        t = threading.Thread(target=stale_call)
+        t.start()
+        arrived.wait()
+        self.assertEqual(self.client.refresh(url, {"Accept-Language": "zh"}).body, V2)
+        gate.open()
+        t.join(15)
+        self.assertNotIn("err", held)
+        self.assertEqual(held["res"].body, V2)
+        self.assertFalse(held["res"].stale)
+        self.assertEqual(held["res"].source, Source.CACHE)
+
+    def test_late_failure_without_refresh_reports_upstream(self):
+        url = self.prime()
+        self.clock.advance(20)
+        self.server.route("/sie", lambda req: ResponseSpec(503, [], b"down"))
+        res = self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=5)
+        # 10s stale > the per-call 5s limit: the upstream failure is reported
+        self.assert_no_fallback_503(res)
+
+    def test_replace_representation_without_vary_change_not_resurrected(self):
+        """refresh publishes a new ETag/body under the same rule; the late
+        failure must not return the replaced older body."""
+
+        V1, V2 = b"directory v1", b"directory v2 (refreshed)"
+        gate, arrived, state = Gate(), Flag(), {"phase": 1}
+
+        def route(req):
+            if req.header("if-none-match") == '"v1"':
+                arrived.set()
+                gate.wait()
+                return ResponseSpec(503, [("Date", http_date(self.clock()))], b"down")
+            if state["phase"] == 1:
+                return ResponseSpec(
+                    200,
+                    [("Vary", "Accept-Language"),
+                     ("Cache-Control", "max-age=10, stale-if-error=60"),
+                     ("ETag", '"v1"'), ("Date", http_date(self.clock()))],
+                    V1,
+                )
+            return ResponseSpec(
+                200,
+                [("Vary", "Accept-Language"),
+                 ("Cache-Control", "max-age=300, stale-if-error=60"),
+                 ("ETag", '"v2"'), ("Date", http_date(self.clock()))],
+                V2,
+            )
+
+        self.server.route("/page", route)
+        url = self.url("/page")
+        self.assertEqual(self.client.get(url, {"Accept-Language": "zh"}).body, V1)
+        state["phase"] = 2
+        self.clock.advance(20)
+
+        held = {}
+
+        def stale_call():
+            try:
+                held["res"] = self.client.get(
+                    url, {"Accept-Language": "zh"}, stale_if_error=60
+                )
+            except BaseException as exc:  # noqa: BLE001
+                held["err"] = exc
+
+        t = threading.Thread(target=stale_call)
+        t.start()
+        arrived.wait()
+        self.assertEqual(self.client.refresh(url, {"Accept-Language": "zh"}).body, V2)
+        gate.open()
+        t.join(15)
+        self.assertNotIn("err", held)
+        self.assertNotEqual(held["res"].body, V1)
+        self.assertEqual(held["res"].body, V2)
+
+    def test_vary_rule_change_during_failure_does_not_cross_representations(self):
+        """If the rule set changed while the request was in flight, the old
+        representation is deleted; the failure must surface (no stale body
+        from a retired rule)."""
+
+        gate, arrived, state = Gate(), Flag(), {"phase": 1}
+
+        def route(req):
+            if state["phase"] == 1:
+                if req.header("if-none-match") == '"old1"':
+                    arrived.set()
+                    gate.wait()
+                    return ResponseSpec(
+                        503, [("Date", http_date(self.clock()))], b"down")
+                return ResponseSpec(
+                    200,
+                    [("Vary", "Accept-Language"),
+                     ("Cache-Control", "max-age=10, stale-if-error=60"),
+                     ("ETag", '"old1"'), ("Date", http_date(self.clock()))],
+                    ZH_BODY,
+                )
+            # new rule set: language + region
+            return ResponseSpec(
+                200,
+                [("Vary", "Accept-Language, X-Region"),
+                 ("Cache-Control", "max-age=300, stale-if-error=60"),
+                 ("ETag", '"new1"'), ("Date", http_date(self.clock()))],
+                b"new rules body",
+            )
+
+        self.server.route("/dir", route)
+        url = self.url("/dir")
+        self.assertEqual(self.client.get(url, {"Accept-Language": "zh"}).body, ZH_BODY)
+        self.clock.advance(20)
+
+        held = {}
+
+        def stale_call():
+            try:
+                held["res"] = self.client.get(
+                    url, {"Accept-Language": "zh"}, stale_if_error=60
+                )
+            except BaseException as exc:  # noqa: BLE001
+                held["err"] = exc
+
+        t = threading.Thread(target=stale_call)
+        t.start()
+        arrived.wait()
+        state["phase"] = 2
+        self.assertEqual(
+            self.client.refresh(url, {"Accept-Language": "zh", "X-Region": "r1"}).body,
+            b"new rules body",
+        )
+        gate.open()
+        t.join(15)
+        self.assertFalse(t.is_alive())
+        # the retired-rule representation must not come back as a fallback
+        self.assertNotIn("body-zh", str(held))
+        if "err" in held:
+            self.assertIsInstance(held["err"], NetworkError)
+        else:
+            self.assertNotEqual(held["res"].body, ZH_BODY)
+            self.assertFalse(held["res"].stale)
+
+    # -- recovery: next upstream success refetches and updates the cache ---
+
+    def test_304_can_grant_or_revoke_stale_if_error(self):
+        state = {"phase": 1}
+
+        def route(req):
+            if state["phase"] == 1:
+                return ResponseSpec(
+                    200,
+                    [("Vary", "Accept-Language"),
+                     ("Cache-Control", "max-age=10"),  # no grant yet
+                     ("ETag", '"g1"'), ("Date", http_date(self.clock()))],
+                    self.BODY,
+                )
+            if state["phase"] == 2:
+                return ResponseSpec(
+                    304,
+                    [("Cache-Control", "max-age=10, stale-if-error=60"),
+                     ("Date", http_date(self.clock()))],
+                    b"",
+                )
+            return ResponseSpec(
+                304,
+                [("Cache-Control", "max-age=10"),  # grant revoked
+                 ("Date", http_date(self.clock()))],
+                b"",
+            )
+
+        self.server.route("/grant", route)
+        url = self.url("/grant")
+        self.assertEqual(self.client.get(url, {"Accept-Language": "zh"}).body, self.BODY)
+        state["phase"] = 2
+        self.clock.advance(10)
+        # 304 grants stale-if-error: the next failure may fall back
+        self.assertEqual(
+            self.client.get(url, {"Accept-Language": "zh"}).source,
+            Source.REVALIDATED,
+        )
+        self.clock.advance(12)
+        self.server.route("/grant", lambda req: ResponseSpec(503, [], b"down"))
+        res = self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=60)
+        self.assert_fallback(res, status=503, staleness=2.0)
+        # a later successful 304 that does not mention stale-if-error revokes
+        self.server.route("/grant", route)
+        state["phase"] = 3
+        self.clock.advance(10)
+        self.assertEqual(
+            self.client.get(url, {"Accept-Language": "zh"}).source,
+            Source.REVALIDATED,
+        )
+        self.server.route("/grant", lambda req: ResponseSpec(503, [], b"down"))
+        self.clock.advance(15)  # past the revalidated lifetime
+        res = self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=60)
+        self.assert_no_fallback_503(res)
+
+    def test_recovery_refetches_and_updates_cache(self):
+        state = {"up": False}
+
+        def route(req):
+            if state["up"]:
+                return ResponseSpec(
+                    200,
+                    [("Vary", "Accept-Language"),
+                     ("Cache-Control", "max-age=300, stale-if-error=60"),
+                     ("ETag", '"v2"'), ("Date", http_date(self.clock()))],
+                    self.LATER,
+                )
+            if req.header("if-none-match") == '"s1"':
+                return ResponseSpec(
+                    304, [("Cache-Control", "max-age=10, stale-if-error=60"),
+                          ("Date", http_date(self.clock()))], b"")
+            return ResponseSpec(
+                200,
+                [("Vary", "Accept-Language"),
+                 ("Cache-Control", "max-age=10, stale-if-error=60"),
+                 ("ETag", '"s1"'), ("Date", http_date(self.clock()))],
+                self.BODY,
+            )
+
+        self.server.route("/rec", route)
+        url = self.url("/rec")
+        self.assertEqual(self.client.get(url, {"Accept-Language": "zh"}).body, self.BODY)
+        self.clock.advance(20)
+        state["up"] = False
+        self.server.route("/rec", lambda req: ResponseSpec(503, [], b"down"))
+        stale = self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=60)
+        self.assert_fallback(stale, status=503, staleness=10.0)
+        # upstream recovers: the next call retries the network and replaces
+        state["up"] = True
+        self.server.route("/rec", route)
+        self.clock.advance(1)
+        res = self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=60)
+        self.assertEqual(res.body, self.LATER)
+        self.assertEqual(res.source, Source.NETWORK)
+        self.assertEqual(res.network_status, 200)
+        self.assertFalse(res.stale)
+        # the new response is cached with its own lifetime; no more traffic
+        again = self.client.get(url, {"Accept-Language": "zh"})
+        self.assertEqual(again.body, self.LATER)
+        self.assertEqual(again.source, Source.CACHE)
+        self.assertTrue(again.age.lifetime == 300.0)
+
+    def test_fallback_does_not_extend_lifetime_or_rewrite_storage(self):
+        url = self.prime(cache_control="max-age=10, stale-if-error=60")
+        self.clock.advance(20)
+        self.server.route("/sie", lambda req: ResponseSpec(503, [], b"down"))
+        res = self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=60)
+        self.assertEqual(res.age.lifetime, 10.0)  # unchanged
+        self.assertAlmostEqual(res.age.current_age, 20.0)
+        # fetch again later: still stale, still refused once past the grant
+        self.clock.advance(40)  # staleness 50 <= 60: still allowed
+        self.assertTrue(
+            self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=60).stale
+        )
+        self.clock.advance(20)  # staleness 70 > 60
+        res = self.client.get(url, {"Accept-Language": "zh"}, stale_if_error=60)
+        self.assert_no_fallback_503(res)
 
 
 class TestFreshnessModel(ClientTestCase):

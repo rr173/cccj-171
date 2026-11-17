@@ -7,22 +7,31 @@ hierarchy rooted at RepCacheError.
 from .client import RepCacheClient
 from .errors import (
     CacheClosed,
+    LengthMismatchError,
+    MalformedResponseError,
     NetworkError,
+    OversizeError,
     ProtocolError,
     RepCacheError,
     RequestRejected,
+    TransportError,
 )
-from .model import AgeInfo, FetchResult, Source
+from .model import AgeInfo, FetchResult, Source, StaleFallback
 
 __all__ = [
     "RepCacheClient",
     "FetchResult",
     "Source",
     "AgeInfo",
+    "StaleFallback",
     "RepCacheError",
     "RequestRejected",
     "ProtocolError",
     "NetworkError",
+    "TransportError",
+    "OversizeError",
+    "LengthMismatchError",
+    "MalformedResponseError",
     "CacheClosed",
 ]
 

@@ -16,13 +16,20 @@ Coordination model
   representation only if the final Vary rule still selects them; on
   no-store / Vary:* / late-arriving responses nothing was stored, so they
   fetch independently.  A failed leader wakes everyone with the same error.
+* stale-if-error is strictly per call.  An eligible failure (transport
+  failure or HTTP 500/502/503/504) is published to waiters as a *failure*,
+  never as a body.  Each caller then re-reads the current cache state and
+  decides on its own against its own limit, so waiters with different limits
+  can legitimately disagree.  A body replaced by refresh in the meantime is
+  never resurrected.
 """
 
 from __future__ import annotations
 
+import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional, Tuple
 
 from .errors import (
@@ -30,9 +37,10 @@ from .errors import (
     NetworkError,
     ProtocolError,
     RepCacheError,
+    RequestRejected,
 )
 from .http1 import WireResponse, wire_request
-from .model import AgeInfo, FetchResult, Source
+from .model import AgeInfo, FetchResult, Source, StaleFallback
 from .parsing import (
     ResponseMeta,
     compute_current_age,
@@ -46,6 +54,9 @@ from .urlutil import PreparedRequest, prepare_request
 
 _MAX_REVALIDATION_RETRIES = 8
 
+#: HTTP statuses for which an opt-in stale body may replace the failure.
+_STALE_FALLBACK_STATUSES = frozenset({500, 502, 503, 504})
+
 
 class _Retry(Exception):
     """Internal: the in-flight validation became obsolete; re-select."""
@@ -54,20 +65,38 @@ class _Retry(Exception):
 _RETRY = _Retry()
 
 
+@dataclass(frozen=True)
+class _Failure:
+    """An upstream failure shared with waiters; carries no selected body."""
+
+    error: Optional[BaseException] = None  # transport failure, if any
+    wire: Optional[WireResponse] = None  # HTTP failure response, if any
+
+    @property
+    def status(self) -> Optional[int]:
+        return self.wire.status if self.wire is not None else None
+
+    def describe(self) -> Optional[str]:
+        return str(self.error) if self.error is not None else None
+
+
 class _InFlight:
-    __slots__ = ("_event", "error")
+    __slots__ = ("_event", "outcome")
 
     def __init__(self) -> None:
         self._event = threading.Event()
-        self.error: Optional[BaseException] = None
+        #: None = success (waiters re-select and fetch for themselves if
+        #: nothing was stored); _Failure = eligible upstream failure; or an
+        #: exception that every waiter must re-raise.
+        self.outcome: object = None
 
-    def finish(self, error: Optional[BaseException]) -> None:
-        self.error = error
+    def finish(self, outcome: object) -> None:
+        self.outcome = outcome
         self._event.set()
 
-    def wait(self) -> Optional[BaseException]:
+    def wait(self) -> object:
         self._event.wait()
-        return self.error
+        return self.outcome
 
 
 @dataclass
@@ -79,6 +108,21 @@ class _Plan:
     if_none_match: Optional[str] = None
     snap_epoch: Optional[int] = None
     snap_vary_values: Optional[str] = None
+
+
+def _check_stale_if_error(value: object) -> Optional[float]:
+    """Validate the per-call stale-if-error limit (None = disabled)."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RequestRejected("stale_if_error must be a number of seconds or None")
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise RequestRejected(
+            "stale_if_error must be a finite, non-negative number of seconds"
+        )
+    return seconds
 
 
 def _select_values(
@@ -120,22 +164,40 @@ class RepCacheClient:
 
     # ------------------------------------------------------------------ API
 
-    def get(self, url: str, headers=None) -> FetchResult:
-        """Fetch a representation, reusing the cache whenever allowed."""
+    def get(self, url: str, headers=None, *, stale_if_error=None) -> FetchResult:
+        """Fetch a representation, reusing the cache whenever allowed.
+
+        ``stale_if_error`` (seconds, default None = disabled) opts this single
+        call into serving an expired stored representation when the origin
+        fails with a transport error or 500/502/503/504.  Both the response's
+        own ``stale-if-error`` grant and this limit must permit the body, and
+        it must still match the request's Vary values.  The returned result is
+        marked ``source=STALE_IF_ERROR``/``stale=True`` and carries the
+        upstream failure; it is never reported as fresh or as a successful
+        fetch.  ``refresh`` never falls back.
+        """
 
         req = prepare_request(url, headers)
+        limit = _check_stale_if_error(stale_if_error)
         retries = 0
         while True:
             plan = self._plan(req)
             if plan.kind == "result":
                 return plan.result
             if plan.kind == "wait":
-                error = plan.handle.wait()
-                if error is not None:
-                    raise error
+                outcome = plan.handle.wait()
+                if isinstance(outcome, _Failure):
+                    stale = self._stale_fallback(req, outcome, limit)
+                    if stale is not None:
+                        return stale
+                    if outcome.wire is not None:
+                        return self._result_from_wire(req, outcome.wire)
+                    raise outcome.error
+                if isinstance(outcome, BaseException):
+                    raise outcome
                 continue
             try:
-                return self._lead(req, plan)
+                return self._lead(req, plan, limit)
             except _Retry:
                 retries += 1
                 if retries > _MAX_REVALIDATION_RETRIES:
@@ -144,7 +206,10 @@ class RepCacheClient:
 
     def refresh(self, url: str, headers=None) -> FetchResult:
         """Administrator fetch: unconditional GET, never joins in-flight
-        normal fetches and runs in parallel with them."""
+        normal fetches and runs in parallel with them.
+
+        Failures always surface; refresh never serves a stale body.
+        """
 
         req = prepare_request(url, headers)
         with self._lock:
@@ -238,6 +303,82 @@ class RepCacheClient:
             return False
         return compute_current_age(rep.initial_age, rep.r, now) < rep.lifetime
 
+    # ------------------------------------------------------ stale-if-error
+
+    def _stale_fallback(
+        self, req: PreparedRequest, failure: _Failure, limit: Optional[float]
+    ) -> Optional[FetchResult]:
+        """Serve an expired representation for an eligible failure, per call.
+
+        The decision is made *after* the failure, against the current cache
+        state, so a waiter never inherits the leader's chosen body.  The body
+        must still match this request's Vary values under the *current* rule
+        (a replaced representation or changed rule simply yields nothing), and
+        both the stored response's ``stale-if-error`` grant and the caller's
+        limit must admit the staleness.  Serving is read-only: nothing about
+        the stored representation (storage time, lifetime, metadata) changes.
+
+        A representation that became fresh again (e.g. refresh replaced it
+        while the request was in flight) is re-selected for *every* caller as
+        a plain cache hit; the replaced older body is never resurrected.
+        """
+
+        now = self._clock()
+        with self._lock:
+            self._ensure_open()
+            rule = self._store.get_rule(req.identity)
+            if rule is None:
+                return None
+            values = _select_values(rule.fields, req.headers)
+            values_json = dumps_values(values)
+            rep = self._store.get_rep(req.identity, rule.epoch, values_json)
+            if rep is None:
+                return None
+            if now < rep.r:
+                # Clock moved backwards: staleness would be meaningless.
+                return None
+            current_age = compute_current_age(rep.initial_age, rep.r, now)
+            if (
+                rep.lifetime is not None
+                and not rep.must_validate
+                and current_age < rep.lifetime
+            ):
+                # A newer representation replaced the failed one while the
+                # request was on the wire.  Re-select it as a plain fresh hit
+                # instead of resurrecting anything older or failing.
+                return self._result_from_rep(
+                    rep, now, Source.CACHE, validated=False, network_status=None
+                )
+            if limit is None:
+                return None
+            if rep.lifetime is None or not rep.allows_stale_if_error:
+                return None
+            if rep.stale_if_error is None:
+                return None
+            staleness = current_age - rep.lifetime
+            allowed = min(rep.stale_if_error, limit)
+            if staleness > allowed:
+                return None
+            result = self._result_from_rep(
+                rep,
+                now,
+                Source.STALE_IF_ERROR,
+                validated=False,
+                network_status=failure.status,
+            )
+        return replace(
+            result,
+            stale=True,
+            stale_fallback=StaleFallback(
+                upstream_status=failure.status,
+                upstream_error=failure.describe(),
+                staleness=staleness,
+                allowed_seconds=allowed,
+                server_limit=rep.stale_if_error,
+                caller_limit=limit,
+            ),
+        )
+
     # -------------------------------------------------------------- leading
 
     def _transport(self, req: PreparedRequest, if_none_match: Optional[str]) -> WireResponse:
@@ -253,30 +394,59 @@ class RepCacheClient:
             if_none_match=if_none_match,
         )
 
-    def _lead(self, req: PreparedRequest, plan: _Plan) -> FetchResult:
+    def _lead(
+        self, req: PreparedRequest, plan: _Plan, limit: Optional[float]
+    ) -> FetchResult:
+        failure = None
         try:
             wire = self._transport(req, plan.if_none_match)
             outcome = self._process_wire(req, plan, wire)
+            if not isinstance(outcome, _Failure):
+                self._complete(plan, None)
+                return outcome
+            failure = outcome
         except _Retry:
+            self._complete(plan, None)
+            raise
+        except RequestRejected:
+            # The caller's own request is invalid; waiters are unaffected.
             self._complete(plan, None)
             raise
         except BaseException as exc:
             error = exc if isinstance(exc, RepCacheError) else NetworkError(str(exc))
-            self._complete(plan, error)
-            raise
-        self._complete(plan, None)
-        return outcome
+            if error.stale_if_error_eligible:
+                # Publish the failure, not a body: each waiter decides for
+                # itself against its own limit and the current cache state.
+                failure = _Failure(error=error)
+            else:
+                self._complete(plan, error)
+                raise
+        # Eligible upstream failure: this caller, like every waiter, decides
+        # independently from the current cache state.
+        self._complete(plan, failure)
+        stale = self._stale_fallback(req, failure, limit)
+        if stale is not None:
+            return stale
+        if failure.wire is not None:
+            return self._result_from_wire(req, failure.wire)
+        raise failure.error
 
-    def _complete(self, plan: _Plan, error: Optional[BaseException]) -> None:
+    def _complete(self, plan: _Plan, outcome: object) -> None:
         with self._lock:
             self._inflight.pop(plan.key, None)
-            plan.handle.finish(error)
+            plan.handle.finish(outcome)
 
-    def _process_wire(self, req: PreparedRequest, plan: _Plan, wire: WireResponse) -> FetchResult:
+    def _process_wire(
+        self, req: PreparedRequest, plan: _Plan, wire: WireResponse
+    ) -> object:
         if wire.status == 200:
             return self._process_200(req, plan, wire)
         if wire.status == 304:
             return self._process_304(req, plan, wire)
+        if wire.status in _STALE_FALLBACK_STATUSES:
+            # Handed to the caller verbatim (or replaced per-call by a stale
+            # body); never stored.
+            return _Failure(wire=wire)
         # Any other status is handed to the caller verbatim and never stored.
         return self._result_from_wire(req, wire)
 
@@ -331,6 +501,8 @@ class RepCacheClient:
                 q=wire.q,
                 r=wire.r,
                 initial_age=initial_age,
+                must_revalidate=meta.cache_control.must_revalidate,
+                stale_if_error=meta.cache_control.stale_if_error,
             )
         )
         return True
@@ -381,6 +553,12 @@ class RepCacheClient:
         cc = meta.cache_control
         lifetime = cc.lifetime if cc.present else rep.lifetime
         must_validate = cc.must_validate if cc.present else rep.must_validate
+        must_revalidate = (
+            cc.must_revalidate if cc.present else rep.must_revalidate
+        )
+        # A present Cache-Control replaces the whole directive set, so an
+        # omitted stale-if-error on a 304 revokes an earlier grant.
+        stale_if_error = cc.stale_if_error if cc.present else rep.stale_if_error
         date_epoch = meta.date_epoch if meta.date_epoch is not None else rep.date_epoch
         age_header = meta.age if meta.has_age else rep.age_header
         initial_age = compute_initial_age(date_epoch, age_header, wire.q, wire.r)
@@ -401,6 +579,8 @@ class RepCacheClient:
             q=wire.q,
             r=wire.r,
             initial_age=initial_age,
+            must_revalidate=must_revalidate,
+            stale_if_error=stale_if_error,
         )
 
     # -------------------------------------------------------------- results

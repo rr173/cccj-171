@@ -1,9 +1,10 @@
 """Parsing of the supported HTTP response-metadata subset.
 
 Supported: Vary (field list or *), Cache-Control (s-maxage, max-age,
-no-cache, no-store), a single valid ETag (weak tags included, used verbatim),
-Date and Age.  Anything malformed or conflicting raises ProtocolError; the
-caller keeps its previous cache and the failed exchange is never stored.
+no-cache, no-store, must-revalidate, stale-if-error), a single valid ETag
+(weak tags included, used verbatim), Date and Age.  Anything malformed or
+conflicting raises ProtocolError; the caller keeps its previous cache and the
+failed exchange is never stored.
 """
 
 from __future__ import annotations
@@ -64,6 +65,8 @@ class CacheControl:
     no_store: bool
     no_cache: bool
     lifetime: Optional[float]  # s-maxage wins over max-age; None = no lifetime
+    must_revalidate: bool = False
+    stale_if_error: Optional[float] = None  # None = no stale-if-error grant
 
     @property
     def must_validate(self) -> bool:
@@ -76,8 +79,10 @@ def parse_cache_control(headers: Sequence[Tuple[str, str]]) -> CacheControl:
         return CacheControl(False, False, False, None)
     s_maxage: Optional[int] = None
     max_age: Optional[int] = None
+    stale_if_error: Optional[int] = None
     no_store = False
     no_cache = False
+    must_revalidate = False
     for value in values:
         for part in value.split(","):
             part = part.strip()
@@ -90,10 +95,12 @@ def parse_cache_control(headers: Sequence[Tuple[str, str]]) -> CacheControl:
                     no_store = True
                 elif name == "no-cache":
                     no_cache = True
-                # other flag directives (public, must-revalidate, ...) ignored
+                elif name == "must-revalidate":
+                    must_revalidate = True
+                # other flag directives (public, private, ...) ignored
                 continue
             raw = raw.strip()
-            if name in ("s-maxage", "max-age"):
+            if name in ("s-maxage", "max-age", "stale-if-error"):
                 if not raw.isdigit():
                     raise ProtocolError(f"invalid {name} value {raw!r}")
                 number = int(raw)
@@ -101,10 +108,16 @@ def parse_cache_control(headers: Sequence[Tuple[str, str]]) -> CacheControl:
                     if s_maxage is not None:
                         raise ProtocolError("conflicting s-maxage directives")
                     s_maxage = number
-                else:
+                elif name == "max-age":
                     if max_age is not None:
                         raise ProtocolError("conflicting max-age directives")
                     max_age = number
+                else:
+                    if stale_if_error is not None:
+                        raise ProtocolError(
+                            "conflicting stale-if-error directives"
+                        )
+                    stale_if_error = number
             # unknown directives with values are ignored
     lifetime = s_maxage if s_maxage is not None else max_age
     return CacheControl(
@@ -112,6 +125,8 @@ def parse_cache_control(headers: Sequence[Tuple[str, str]]) -> CacheControl:
         no_store,
         no_cache,
         float(lifetime) if lifetime is not None else None,
+        must_revalidate,
+        float(stale_if_error) if stale_if_error is not None else None,
     )
 
 

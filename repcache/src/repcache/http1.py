@@ -2,7 +2,10 @@
 
 No redirects, no content compression (the client always requests identity),
 response size limited, declared length verified.  Truncated or oversize
-bodies raise NetworkError and are never handed to the cache.
+bodies are never handed to the cache.  Failures are classified finely enough
+for the opt-in stale-if-error fallback: only TransportError (connect error,
+timeout, reset, truncated stream) may be masked; oversize, length mismatch,
+malformed framing and protocol violations always surface.
 """
 
 from __future__ import annotations
@@ -12,7 +15,13 @@ import socket
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
-from .errors import NetworkError, ProtocolError
+from .errors import (
+    LengthMismatchError,
+    MalformedResponseError,
+    OversizeError,
+    ProtocolError,
+    TransportError,
+)
 
 _BODYLESS_STATUSES = frozenset({204, 304})
 
@@ -41,8 +50,10 @@ def wire_request(
 ) -> WireResponse:
     """Perform one GET and return the complete response.
 
-    Raises NetworkError on timeout/truncation/oversize and ProtocolError on
-    responses outside the supported subset.
+    Raises TransportError on connect failure/timeout/reset/truncation,
+    OversizeError or LengthMismatchError on size problems,
+    MalformedResponseError on unsupported framing and ProtocolError on
+    responses outside the supported metadata subset.
     """
 
     conn_cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
@@ -52,6 +63,7 @@ def wire_request(
         header_dict["If-None-Match"] = if_none_match
     header_dict["Connection"] = "close"
     q = clock()
+    resp = None
     try:
         conn.request("GET", path_query, headers=header_dict)
         resp = conn.getresponse()
@@ -82,18 +94,18 @@ def wire_request(
                 and status not in _BODYLESS_STATUSES
                 and not 100 <= status < 200
             ):
-                raise NetworkError(
+                raise OversizeError(
                     f"response too large: declared {declared} bytes, limit {max_bytes}"
                 )
 
         try:
             body = resp.read(max_bytes + 1)
         except http.client.IncompleteRead as exc:
-            raise NetworkError(f"truncated body: {exc}") from exc
+            raise TransportError(f"truncated body: {exc}") from exc
         r = clock()
 
         if len(body) > max_bytes:
-            raise NetworkError(
+            raise OversizeError(
                 f"response too large: got more than {max_bytes} bytes"
             )
         if (
@@ -102,15 +114,22 @@ def wire_request(
             and status not in _BODYLESS_STATUSES
             and not 100 <= status < 200
         ):
-            raise NetworkError(
+            raise LengthMismatchError(
                 f"length mismatch: declared {declared}, received {len(body)}"
             )
         return WireResponse(status, reason, tuple(resp_headers), body, q, r)
-    except (NetworkError, ProtocolError):
+    except (ProtocolError, TransportError, OversizeError, LengthMismatchError):
         raise
     except (socket.timeout, TimeoutError) as exc:
-        raise NetworkError(f"timeout: {exc}") from exc
-    except (OSError, http.client.HTTPException) as exc:
-        raise NetworkError(f"transport failure: {exc}") from exc
+        raise TransportError(f"timeout: {exc}") from exc
+    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as exc:
+        # includes http.client.RemoteDisconnected: the peer went away mid-stream
+        raise TransportError(f"connection lost: {exc}") from exc
+    except http.client.HTTPException as exc:
+        raise MalformedResponseError(f"malformed response: {exc}") from exc
+    except OSError as exc:
+        raise TransportError(f"transport failure: {exc}") from exc
     finally:
+        if resp is not None:
+            resp.close()
         conn.close()
